@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+Icinga / Nagios check for pgBackRest.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import datetime
+
+import nagiosplugin
+
+__author__ = "Adrian Vondendriesch"
+__version__ = "0.1.0"
+__license__ = "MIT"
+
+class PgBackRest(nagiosplugin.Resource):
+    """ Encapsulate relevant methods that are required for checking
+        various metrics of pgBackRest backups for a given stanza. """
+
+    stanza = "main"
+
+    def probe(self):
+        """ Method executed by nagiosplugin. """
+        info_json = self.get_stanza_info()
+
+        full_backup_count = int(self.get_backup_count_of_type(info_json, "full"))
+        diff_backup_count = int(self.get_backup_count_of_type(info_json, "diff"))
+        incr_backup_count = int(self.get_backup_count_of_type(info_json, "incr"))
+
+        (
+            newest_full_backup_timestamp,
+            oldest_full_backup_timestamp
+        ) = self.get_backup_timestamps_of_type(info_json, "full")
+        (
+            newest_diff_backup_timestamp,
+            oldest_diff_backup_timestamp
+        ) = self.get_backup_timestamps_of_type(info_json, "diff")
+        (
+            newest_incr_backup_timestamp,
+            oldest_incr_backup_timestamp
+        ) = self.get_backup_timestamps_of_type(info_json, "incr")
+
+        newest_full_backup_age = self.get_age_of_timestamp(newest_full_backup_timestamp)
+        oldest_full_backup_age = self.get_age_of_timestamp(oldest_full_backup_timestamp)
+        newest_diff_backup_age = self.get_age_of_timestamp(newest_diff_backup_timestamp)
+        oldest_diff_backup_age = self.get_age_of_timestamp(oldest_diff_backup_timestamp)
+        newest_incr_backup_age = self.get_age_of_timestamp(newest_incr_backup_timestamp)
+        oldest_incr_backup_age = self.get_age_of_timestamp(oldest_incr_backup_timestamp)
+
+        return [
+            nagiosplugin.Metric('full_backups',
+                                full_backup_count,
+                                context='pgbackrest_count_full'),
+            nagiosplugin.Metric('diff_backups',
+                                diff_backup_count,
+                                context='pgbackrest_count_diff'),
+            nagiosplugin.Metric('incr_backups',
+                                incr_backup_count,
+                                context='pgbackrest_count_incr'),
+            nagiosplugin.Metric('newest_full_age',
+                                newest_full_backup_age,
+                                context='pgbackrest_newest_full_age'),
+            nagiosplugin.Metric('oldest_full_age',
+                                oldest_full_backup_age,
+                                context='pgbackrest_oldest_full_age'),
+            nagiosplugin.Metric('newest_diff_age',
+                                newest_diff_backup_age,
+                                context='pgbackrest_newest_diff_age'),
+            nagiosplugin.Metric('oldest_diff_age',
+                                oldest_diff_backup_age,
+                                context='pgbackrest_oldest_diff_age'),
+            nagiosplugin.Metric('newest_incr_age',
+                                newest_incr_backup_age,
+                                context='pgbackrest_newest_incr_age'),
+            nagiosplugin.Metric('oldest_incr_age',
+                                oldest_incr_backup_age,
+                                context='pgbackrest_oldest_incr_age')
+            ]
+
+    def get_stanza_info(self):
+        """ Get Details about stanza backups. """
+
+        command = "pgbackrest info --output json --stanza {}"
+        command = command.format(self.stanza)
+
+        subprocess_env = dict(os.environ)
+        subprocess_env['LC_ALL'] = 'C'
+        try:
+            proc = subprocess.Popen(command.split(), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=subprocess_env)
+            (stdout, stderr) = proc.communicate()
+            (stdout, stderr) = (stdout.decode("UTF-8"),
+                                stderr.decode("UTF-8"))
+        except Exception as ex:
+            raise ex
+
+        returncode = proc.returncode
+        if returncode != 0:
+            sys.stderr.write("ERROR: Error getting stanza information "
+                             "(RC={}).\n".format(returncode))
+            sys.stderr.write("DETAIL: \"{}\"\n".format(stdout))
+            exit(1)
+        else:
+            info_out_json = json.loads(stdout)
+            # print(json.dumps(info_out_json, indent=4))
+
+        return info_out_json
+
+    @staticmethod
+    def get_backup_timestamps_of_type(info_json, backup_type):
+        """ Get the timestamp of the newest and oldest backup of a
+            given type. """
+
+        backup_list = info_json[0]["backup"]
+
+        newest_timestamp = None
+        oldest_timestamp = None
+
+        for backup in backup_list:
+            if backup["type"] == backup_type:
+                timestamp = backup["timestamp"]["stop"]
+
+                if newest_timestamp is None or newest_timestamp > timestamp:
+                    newest_timestamp = timestamp
+
+                if oldest_timestamp is None or oldest_timestamp > timestamp:
+                    oldest_timestamp = timestamp
+
+        return (newest_timestamp, oldest_timestamp)
+
+    @staticmethod
+    def get_age_of_timestamp(backup_timestamp):
+        """ Returns the age in seconds. Returns zero on None
+            input. """
+
+        if backup_timestamp is None:
+            return 0
+
+        now_timestamp = datetime.datetime.now().timestamp()
+
+        return int(now_timestamp - backup_timestamp)
+
+    @staticmethod
+    def get_backup_count_of_type(info_json, backup_type):
+        """ Parse the given info_json (normaly from get_stanza_info())
+            and count backups of a given type. """
+
+        backup_list = info_json[0]["backup"]
+        backup_count = 0
+
+        for backup in backup_list:
+            if backup["type"] == backup_type:
+                backup_count = backup_count +1
+
+        if ARGS.debug:
+            print("DEBUG: Found {} {} backups."
+                  "".format(backup_count, backup_type))
+
+        return backup_count
+
+def main():
+    """ Main procedure """
+    # check = nagiosplugin.Check(PgBackRest())
+    check = nagiosplugin.Check(
+        PgBackRest(),
+        nagiosplugin.ScalarContext('pgbackrest_count_full',
+                                   ARGS.warning_full,
+                                   ARGS.critical_full),
+        nagiosplugin.ScalarContext('pgbackrest_count_diff',
+                                   ARGS.warning_diff,
+                                   ARGS.critical_diff),
+        nagiosplugin.ScalarContext('pgbackrest_count_incr',
+                                   ARGS.warning_incr,
+                                   ARGS.critical_incr),
+        nagiosplugin.ScalarContext('pgbackrest_newest_full_age',
+                                   ARGS.warning_newest_full_age,
+                                   ARGS.critical_newest_full_age),
+        nagiosplugin.ScalarContext('pgbackrest_oldest_full_age',
+                                   ARGS.warning_oldest_full_age,
+                                   ARGS.critical_oldest_full_age),
+        nagiosplugin.ScalarContext('pgbackrest_newest_diff_age',
+                                   ARGS.warning_newest_diff_age,
+                                   ARGS.critical_newest_diff_age),
+        nagiosplugin.ScalarContext('pgbackrest_oldest_diff_age',
+                                   ARGS.warning_oldest_diff_age,
+                                   ARGS.critical_oldest_diff_age),
+        nagiosplugin.ScalarContext('pgbackrest_newest_incr_age',
+                                   ARGS.warning_newest_incr_age,
+                                   ARGS.critical_newest_incr_age),
+        nagiosplugin.ScalarContext('pgbackrest_oldest_incr_age',
+                                   ARGS.warning_oldest_incr_age,
+                                   ARGS.critical_oldest_incr_age)
+    )
+    check.main()
+
+if __name__ == "__main__":
+    ARGP = argparse.ArgumentParser(description=__doc__)
+    ARGP.add_argument(
+        "-s", "--stanza", metavar="STANZA", type=str, required=True, default="",
+        help="return warning if the number of full backups is outside RANGE")
+    ARGP.add_argument(
+        "-wf", "--warning-full", metavar="RANGE", default="",
+        help="return warning if the number of full backups is outside RANGE")
+    ARGP.add_argument(
+        "-cf", "--critical-full", metavar="RANGE", default="",
+        help="return critical if the number of full backups is outside RANGE")
+    ARGP.add_argument(
+        "-wd", "--warning-diff", metavar="RANGE", default="",
+        help="return warning if the number of differential "
+             "backups is outside RANGE")
+    ARGP.add_argument(
+        "-cd", "--critical-diff", metavar="RANGE", default="",
+        help="return critical if the number of differential "
+             "backups is outside RANGE")
+    ARGP.add_argument(
+        "-wi", "--warning-incr", metavar="RANGE", default="",
+        help="return warning if the number of incremental "
+             "backups is outside RANGE")
+    ARGP.add_argument(
+        "-ci", "--critical-incr", metavar="RANGE", default="",
+        help="return critical if the number of incremental "
+             "backups is outside RANGE")
+    ARGP.add_argument(
+        "-wnfa", "--warning-newest-full-age", metavar="RANGE", default="",
+        help="return warning if the age of the newest full backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-cnfa", "--critical-newest-full-age", metavar="RANGE", default="",
+        help="return critical if the age of the newest full backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-wofa", "--warning-oldest-full-age", metavar="RANGE", default="",
+        help="return warning if the age of the oldest full backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-cofa", "--critical-oldest-full-age", metavar="RANGE", default="",
+        help="return critical if the age of the oldest full backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-wnda", "--warning-newest-diff-age", metavar="RANGE", default="",
+        help="return warning if the age of the newest diff backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-cnda", "--critical-newest-diff-age", metavar="RANGE", default="",
+        help="return critical if the age of the newest diff backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-woda", "--warning-oldest-diff-age", metavar="RANGE", default="",
+        help="return warning if the age of the oldest diff backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-coda", "--critical-oldest-diff-age", metavar="RANGE", default="",
+        help="return critical if the age of the oldest diff backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-wnia", "--warning-newest-incr-age", metavar="RANGE", default="",
+        help="return warning if the age of the newest incr backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-cnia", "--critical-newest-incr-age", metavar="RANGE", default="",
+        help="return critical if the age of the newest incr backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-woia", "--warning-oldest-incr-age", metavar="RANGE", default="",
+        help="return warning if the age of the oldest incr backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-coia", "--critical-oldest-incr-age", metavar="RANGE", default="",
+        help="return critical if the age of the oldest incr backup is outside RANGE (seconds)")
+    ARGP.add_argument(
+        "-b", "--binary", metavar="STANZA", type=str,
+        default="/usr/bin/pgbackrest",
+        help="path to pgbackrest binary")
+    ARGP.add_argument(
+        "-d", "--debug", action="store_true",
+        help="print debug output")
+    ARGS = ARGP.parse_args()
+    main()
